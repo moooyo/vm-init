@@ -3,6 +3,7 @@
 # SSH安全配置脚本
 # 功能：修改SSH端口为34567，安装配置fail2ban
 # 支持：Ubuntu、Debian、CentOS
+# 特性：可重入，重复执行会覆盖旧配置
 
 set -e
 
@@ -42,48 +43,58 @@ detect_os() {
     echo -e "${GREEN}检测到操作系统: $OS${NC}"
 }
 
-# 备份SSH配置
+# 备份SSH配置（仅在首次运行时备份原始配置）
 backup_ssh_config() {
-    local backup_file="/etc/ssh/sshd_config.backup.$(date +%Y%m%d%H%M%S)"
-    cp /etc/ssh/sshd_config "$backup_file"
-    echo -e "${GREEN}SSH配置已备份到: $backup_file${NC}"
+    local original_backup="/etc/ssh/sshd_config.backup.original"
+    if [ ! -f "$original_backup" ]; then
+        cp /etc/ssh/sshd_config "$original_backup"
+        echo -e "${GREEN}SSH原始配置已备份到: $original_backup${NC}"
+    else
+        echo -e "${YELLOW}原始备份已存在，跳过备份${NC}"
+    fi
 }
 
-# 修改SSH端口
+# 修改SSH端口（可重入）
 change_ssh_port() {
-    echo -e "${YELLOW}正在修改SSH端口为 $NEW_SSH_PORT ...${NC}"
+    echo -e "${YELLOW}正在配置SSH端口为 $NEW_SSH_PORT ...${NC}"
 
     # 备份配置
     backup_ssh_config
 
-    # 修改端口配置
-    if grep -q "^Port " /etc/ssh/sshd_config; then
-        sed -i "s/^Port .*/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
-    elif grep -q "^#Port " /etc/ssh/sshd_config; then
-        sed -i "s/^#Port .*/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
-    else
-        echo "Port $NEW_SSH_PORT" >> /etc/ssh/sshd_config
+    # 检查当前端口配置
+    local current_port=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "")
+
+    if [ "$current_port" = "$NEW_SSH_PORT" ]; then
+        echo -e "${GREEN}SSH端口已经是 $NEW_SSH_PORT，无需修改${NC}"
+        return 0
     fi
 
-    echo -e "${GREEN}SSH端口已修改为 $NEW_SSH_PORT${NC}"
+    # 移除所有现有的Port配置行（确保干净的状态）
+    sed -i '/^Port /d' /etc/ssh/sshd_config
+    sed -i '/^#Port /d' /etc/ssh/sshd_config
+
+    # 添加新端口配置
+    echo "Port $NEW_SSH_PORT" >> /etc/ssh/sshd_config
+
+    echo -e "${GREEN}SSH端口已配置为 $NEW_SSH_PORT${NC}"
 }
 
-# 配置防火墙（针对不同系统）
+# 配置防火墙（可重入，规则会自动去重）
 configure_firewall() {
     echo -e "${YELLOW}正在配置防火墙...${NC}"
 
     case $OS in
         ubuntu|debian)
-            # 检查ufw是否存在
             if command -v ufw &> /dev/null; then
-                ufw allow $NEW_SSH_PORT/tcp
+                # ufw allow 是幂等的，重复执行不会创建重复规则
+                ufw allow $NEW_SSH_PORT/tcp 2>/dev/null || true
                 echo -e "${GREEN}UFW已允许端口 $NEW_SSH_PORT${NC}"
             fi
             ;;
         centos|rhel|fedora|rocky|almalinux)
-            # 检查firewalld
             if systemctl is-active --quiet firewalld 2>/dev/null; then
-                firewall-cmd --permanent --add-port=$NEW_SSH_PORT/tcp
+                # firewall-cmd --add-port 是幂等的
+                firewall-cmd --permanent --add-port=$NEW_SSH_PORT/tcp 2>/dev/null || true
                 firewall-cmd --reload
                 echo -e "${GREEN}Firewalld已允许端口 $NEW_SSH_PORT${NC}"
             fi
@@ -104,7 +115,7 @@ restart_ssh() {
 
     case $OS in
         ubuntu|debian)
-            systemctl restart sshd || systemctl restart ssh
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh
             ;;
         centos|rhel|fedora|rocky|almalinux)
             systemctl restart sshd
@@ -114,8 +125,13 @@ restart_ssh() {
     echo -e "${GREEN}SSH服务已重启${NC}"
 }
 
-# 安装fail2ban
+# 安装fail2ban（可重入，已安装则跳过）
 install_fail2ban() {
+    if command -v fail2ban-client &> /dev/null; then
+        echo -e "${GREEN}fail2ban已安装，跳过安装步骤${NC}"
+        return 0
+    fi
+
     echo -e "${YELLOW}正在安装fail2ban...${NC}"
 
     case $OS in
@@ -124,7 +140,6 @@ install_fail2ban() {
             apt-get install -y fail2ban iptables
             ;;
         centos|rhel|fedora|rocky|almalinux)
-            # CentOS 8+ 使用dnf
             if command -v dnf &> /dev/null; then
                 dnf install -y epel-release
                 dnf install -y fail2ban iptables
@@ -138,12 +153,49 @@ install_fail2ban() {
     echo -e "${GREEN}fail2ban安装完成${NC}"
 }
 
-# 配置fail2ban
+# 停止fail2ban服务（配置前先停止，避免冲突）
+stop_fail2ban() {
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        echo -e "${YELLOW}停止fail2ban服务以更新配置...${NC}"
+        systemctl stop fail2ban
+    fi
+}
+
+# 配置fail2ban（可重入，直接覆盖配置文件）
 configure_fail2ban() {
     echo -e "${YELLOW}正在配置fail2ban...${NC}"
 
-    # 创建jail.local配置文件
-    cat > /etc/fail2ban/jail.local << EOF
+    # 根据系统确定日志路径和后端
+    local sshd_backend="systemd"
+    local sshd_logpath=""
+
+    case $OS in
+        ubuntu|debian)
+            if [ -d /run/systemd/system ]; then
+                sshd_backend="systemd"
+                sshd_logpath=""
+            else
+                sshd_backend="auto"
+                sshd_logpath="/var/log/auth.log"
+            fi
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            if [ -d /run/systemd/system ]; then
+                sshd_backend="systemd"
+                sshd_logpath=""
+            else
+                sshd_backend="auto"
+                sshd_logpath="/var/log/secure"
+            fi
+            ;;
+    esac
+
+    # 直接覆盖jail.local配置文件（可重入）
+    if [ -n "$sshd_logpath" ]; then
+        cat > /etc/fail2ban/jail.local << EOF
+# 由 setup-ssh-security.sh 自动生成
+# 可通过重新运行脚本更新配置
+
 [DEFAULT]
 # 封禁时间：1小时
 bantime = 3600
@@ -161,30 +213,62 @@ banaction_allports = iptables-allports
 # 忽略本地地址
 ignoreip = 127.0.0.1/8 ::1
 
-# 后端使用auto自动检测
-backend = auto
-
-# 启用邮件通知（可选，默认关闭）
-# destemail = admin@example.com
-# sender = fail2ban@example.com
-# mta = sendmail
+# 后端
+backend = $sshd_backend
 
 [sshd]
 enabled = true
 port = $NEW_SSH_PORT
 filter = sshd
-logpath = %(sshd_log)s
+logpath = $sshd_logpath
+backend = $sshd_backend
 maxretry = 5
 findtime = 600
 bantime = 3600
 banaction = iptables-multiport
 EOF
+    else
+        cat > /etc/fail2ban/jail.local << EOF
+# 由 setup-ssh-security.sh 自动生成
+# 可通过重新运行脚本更新配置
 
-    # 创建自定义action配置确保使用iptables
+[DEFAULT]
+# 封禁时间：1小时
+bantime = 3600
+
+# 检测时间窗口：10分钟
+findtime = 600
+
+# 最大尝试次数：5次
+maxretry = 5
+
+# 使用iptables进行封禁
+banaction = iptables-multiport
+banaction_allports = iptables-allports
+
+# 忽略本地地址
+ignoreip = 127.0.0.1/8 ::1
+
+# 后端使用systemd
+backend = systemd
+
+[sshd]
+enabled = true
+port = $NEW_SSH_PORT
+filter = sshd
+backend = systemd
+maxretry = 5
+findtime = 600
+bantime = 3600
+banaction = iptables-multiport
+EOF
+    fi
+
+    # 覆盖iptables配置
     cat > /etc/fail2ban/action.d/iptables-common.local << EOF
 [Init]
 # 使用iptables而非nftables
-# 适用于旧版系统和需要iptables的环境
+# 由 setup-ssh-security.sh 自动生成
 EOF
 
     echo -e "${GREEN}fail2ban配置完成${NC}"
@@ -228,16 +312,17 @@ show_status() {
     echo ""
     echo -e "${RED}重要提示:${NC}"
     echo -e "1. 请确保在关闭当前SSH连接前，先测试新端口是否可以正常连接"
-    echo -e "2. 如需恢复，SSH配置备份在 /etc/ssh/sshd_config.backup.*"
+    echo -e "2. 如需恢复原始配置: cp /etc/ssh/sshd_config.backup.original /etc/ssh/sshd_config && systemctl restart sshd"
     echo -e "3. 查看封禁IP: fail2ban-client status sshd"
     echo -e "4. 解封IP: fail2ban-client set sshd unbanip <IP地址>"
+    echo -e "5. 此脚本可重复执行以更新配置"
     echo ""
 }
 
 # 主函数
 main() {
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}   SSH安全配置脚本${NC}"
+    echo -e "${GREEN}   SSH安全配置脚本 (可重入)${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
 
@@ -247,6 +332,7 @@ main() {
     configure_firewall
     restart_ssh
     install_fail2ban
+    stop_fail2ban
     configure_fail2ban
     start_fail2ban
     show_status
