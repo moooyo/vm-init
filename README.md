@@ -10,10 +10,10 @@ Linux 服务器初始化安全配置脚本集合。
 
 ```bash
 # 使用 curl
-curl -fsSL https://raw.githubusercontent.com/moooyo/vm-init/main/setup-ssh-security.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/moooyo/vm-init/refs/heads/main/setup-ssh-security.sh | sudo bash
 
 # 使用 wget
-wget -qO- https://raw.githubusercontent.com/moooyo/vm-init/main/setup-ssh-security.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/moooyo/vm-init/refs/heads/main/setup-ssh-security.sh | sudo bash
 ```
 
 ## 功能说明
